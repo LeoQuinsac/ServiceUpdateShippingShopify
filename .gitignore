@@ -1,0 +1,9 @@
+*.csv
+*.json
+.DS_Store
+.zed/
+.idea/
+cmd/local/
+*.xlsx
+local
+shipping
