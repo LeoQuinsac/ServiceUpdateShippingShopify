@@ -3,6 +3,7 @@ package lorenkadi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -20,6 +21,20 @@ import (
 	"github.com/xuri/excelize/v2"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/knownhosts"
+	"golang.org/x/time/rate"
+)
+
+const (
+	shopifyAPIVersion                = "2025-07"
+	shopifyClientRetries             = 4
+	shopifyFulfillmentCallsPerSecond = 2
+	shopifyProcessingTimeout         = 5 * time.Minute
+	appErrorLogPrefix                = "APP_ERROR:"
+)
+
+var (
+	errNoShippingLines           = errors.New("order has no shipping lines")
+	errNoPendingFulfillmentOrder = errors.New("no pending fulfillment order found")
 )
 
 func init() {
@@ -46,6 +61,7 @@ type Payload struct {
 
 func executeShopifyUpdateShipping(ctx context.Context, e event.Event) error {
 	date := time.Now().Format("20060102")
+	var appErrors []string
 
 	var msg MessagePublishedData
 	if err := e.DataAs(&msg); err == nil {
@@ -69,7 +85,7 @@ func executeShopifyUpdateShipping(ctx context.Context, e event.Event) error {
 		return nil
 	}
 	if err := GetShopifyOrders(trackingNumbers); err != nil {
-		log.Printf("Failed to process order fulfillments: %v", err)
+		appErrors = append(appErrors, fmt.Sprintf("failed to process order fulfillments: %v", err))
 	}
 
 	if tmpFilePath != "" && remoteFileName != "" {
@@ -77,10 +93,14 @@ func executeShopifyUpdateShipping(ctx context.Context, e event.Event) error {
 		if bucketName == "" {
 			log.Println("GCS_BUCKET_NAME not set, skipping GCS upload")
 		} else if err := uploadToGCS(ctx, bucketName, remoteFileName, tmpFilePath); err != nil {
-			log.Printf("Failed to upload file to GCS: %v", err)
+			appErrors = append(appErrors, fmt.Sprintf("failed to upload file to GCS: %v", err))
 		} else {
 			log.Printf("Successfully uploaded %s to gs://%s/%s", remoteFileName, bucketName, remoteFileName)
 		}
+	}
+
+	if len(appErrors) > 0 {
+		logAppError("execution finished with %d error(s): %s", len(appErrors), strings.Join(appErrors, " | "))
 	}
 
 	return nil
@@ -91,7 +111,7 @@ func GetShopifyOrders(trackingNumbers map[string]string) error {
 	shopifySecret := os.Getenv("SHOPIFY_SECRET")
 	shopifyToken := os.Getenv("SHOPIFY_TOKEN")
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), shopifyProcessingTimeout)
 	defer cancel()
 	app := goshopify.App{
 		ApiKey:    shopifyKey,
@@ -99,9 +119,15 @@ func GetShopifyOrders(trackingNumbers map[string]string) error {
 		Scope:     "read_orders, write_orders, write_assigned_fulfillment_orders, read_assigned_fulfillment_orders, write_fulfillments, read_fulfillments",
 	}
 
-	client, err := goshopify.NewClient(app, "c24ed1-4b", shopifyToken, goshopify.WithVersion("2025-07"))
+	client, err := goshopify.NewClient(
+		app,
+		"c24ed1-4b",
+		shopifyToken,
+		goshopify.WithVersion(shopifyAPIVersion),
+		goshopify.WithRetry(shopifyClientRetries),
+	)
 	if err != nil {
-		log.Fatalln("Erreur lors de la création du client shopify")
+		return fmt.Errorf("failed to create Shopify client: %w", err)
 	}
 
 	shop, err := client.Shop.Get(ctx, nil)
@@ -121,13 +147,20 @@ func GetShopifyOrders(trackingNumbers map[string]string) error {
 
 	// Process each order
 	successCount := 0
+	skippedCount := 0
 	errorCount := 0
+	fulfillmentLimiter := rate.NewLimiter(rate.Limit(shopifyFulfillmentCallsPerSecond), 1)
 
 	for i, order := range orders {
 		log.Printf("Processing order %d/%d (ID: %d)", i+1, len(orders), order.Id)
 
-		if err := processOrder(ctx, client, order, trackingNumbers); err != nil {
-			log.Printf("Error processing order %d: %v", order.Id, err)
+		if err := processOrder(ctx, client, order, trackingNumbers, fulfillmentLimiter); err != nil {
+			if isSkippedOrderIssue(err) {
+				log.Printf("Skipping order %d: %v", order.Id, err)
+				skippedCount++
+				continue
+			}
+			log.Printf("Order processing issue for order %d: %v", order.Id, err)
 			errorCount++
 			continue
 		}
@@ -135,15 +168,18 @@ func GetShopifyOrders(trackingNumbers map[string]string) error {
 		successCount++
 	}
 
-	log.Printf("Processing complete: %d successful, %d errors", successCount, errorCount)
+	log.Printf("Processing complete: %d successful, %d skipped, %d errors", successCount, skippedCount, errorCount)
+	if errorCount > 0 {
+		return fmt.Errorf("%d orders failed during fulfillment processing", errorCount)
+	}
 	return nil
 }
 
 // processOrder handles the fulfillment creation for a single order
-func processOrder(ctx context.Context, client *goshopify.Client, order goshopify.Order, trackingNumbers map[string]string) error {
+func processOrder(ctx context.Context, client *goshopify.Client, order goshopify.Order, trackingNumbers map[string]string, fulfillmentLimiter *rate.Limiter) error {
 	// Validate order has shipping lines
 	if len(order.ShippingLines) == 0 {
-		return fmt.Errorf("order has no shipping lines")
+		return errNoShippingLines
 	}
 
 	// Look up tracking number by order name, then by order number as fallback
@@ -157,6 +193,9 @@ func processOrder(ctx context.Context, client *goshopify.Client, order goshopify
 	}
 
 	// Get fulfillment orders
+	if err := waitForShopifyCallSlot(ctx, fulfillmentLimiter, "list fulfillment orders"); err != nil {
+		return err
+	}
 	fulfillmentOrders, err := client.FulfillmentOrder.List(ctx, order.Id, nil)
 	if err != nil {
 		return fmt.Errorf("failed to get fulfillment orders: %w", err)
@@ -181,8 +220,14 @@ func processOrder(ctx context.Context, client *goshopify.Client, order goshopify
 		},
 	}
 
+	if err := waitForShopifyCallSlot(ctx, fulfillmentLimiter, "create fulfillment"); err != nil {
+		return err
+	}
 	createdFulfillment, err := client.Fulfillment.Create(ctx, fulfillment)
 	if err != nil {
+		if strings.Contains(err.Error(), "unfulfillable status") {
+			return fmt.Errorf("fulfillment order not actionable: %w", errNoPendingFulfillmentOrder)
+		}
 		return fmt.Errorf("failed to create fulfillment: %w", err)
 	}
 
@@ -194,6 +239,24 @@ func processOrder(ctx context.Context, client *goshopify.Client, order goshopify
 	return nil
 }
 
+func waitForShopifyCallSlot(ctx context.Context, limiter *rate.Limiter, operation string) error {
+	if limiter == nil {
+		return nil
+	}
+	if err := limiter.Wait(ctx); err != nil {
+		return fmt.Errorf("failed waiting for Shopify rate limiter before %s: %w", operation, err)
+	}
+	return nil
+}
+
+func isSkippedOrderIssue(err error) bool {
+	return errors.Is(err, errNoShippingLines) || errors.Is(err, errNoPendingFulfillmentOrder)
+}
+
+func logAppError(format string, args ...interface{}) {
+	log.Printf(appErrorLogPrefix+" "+format, args...)
+}
+
 // findPendingFulfillmentOrder finds the first "open" fulfillment order
 func findPendingFulfillmentOrder(fulfillmentOrders []goshopify.FulfillmentOrder) (*goshopify.FulfillmentOrder, error) {
 	for _, fo := range fulfillmentOrders {
@@ -201,7 +264,7 @@ func findPendingFulfillmentOrder(fulfillmentOrders []goshopify.FulfillmentOrder)
 			return &fo, nil
 		}
 	}
-	return nil, fmt.Errorf("no pending fulfillment order found")
+	return nil, errNoPendingFulfillmentOrder
 }
 
 func GetTrackingNumberFromFtpServer(date string) (map[string]string, string, string) {
