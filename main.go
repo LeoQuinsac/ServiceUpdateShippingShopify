@@ -253,7 +253,7 @@ func isSkippedOrderIssue(err error) bool {
 	return errors.Is(err, errNoShippingLines) || errors.Is(err, errNoPendingFulfillmentOrder)
 }
 
-func logAppError(format string, args ...interface{}) {
+func logAppError(format string, args ...any) {
 	log.Printf(appErrorLogPrefix+" "+format, args...)
 }
 
